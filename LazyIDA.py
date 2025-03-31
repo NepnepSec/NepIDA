@@ -4,6 +4,10 @@ from struct import unpack
 import idaapi
 import idautils
 import idc
+import ida_ida
+
+from unicorn import *
+from unicorn.x86_const import *
 
 from PyQt5.Qt import QApplication
 
@@ -14,7 +18,10 @@ ACTION_COPYFO = "lazyida:copyfo"
 ACTION_GOTOCLIPEA = "lazyida:gotoclipea"
 ACTION_GOTOCLIPFO = "lazyida:gotoclipfo"
 ACTION_XORDATA = "lazyida:xordata"
-ACTION_FILLNOP = "lazyida:fillnop"
+ACTION_FILLNOP = "Qfrost:fillnop"
+ACTION_GOTOEA = "huskygg:gotoea"
+ACTION_EMULATE = "Qfrost:emulate"
+ACTION_REINIT_EMULATOR = "Qfrost:reinit_emulator"
 
 ACTION_HX_REMOVERETTYPE = "lazyida:hx_removerettype"
 ACTION_HX_COPYEA = "lazyida:hx_copyea"
@@ -36,6 +43,14 @@ def copy_to_clip(data):
 def clip_text():
     return QApplication.clipboard().text()
 
+def jump_ea():
+    ea_point = idc.here()
+    ea = idc.read_dbg_dword(ea_point)
+    if idc.jumpto(ea):
+        print("jump to 0x%x success" % ea)
+    else:
+        print("0x%x jump err" % ea)
+
 def parse_location(loc, is_fo=False):
     is_named = False
     ascii_text = ""
@@ -51,6 +66,127 @@ def parse_location(loc, is_fo=False):
         except:
             return idaapi.BADADDR
     return loc, is_named, ascii_text
+
+
+def read_memory(addr, size) -> bytes:
+    mem = b""
+    for addr in range(addr, addr + size):
+        mem += idaapi.get_wide_byte(addr).to_bytes( 1, "little")
+    return mem
+
+class Emulator(Uc):
+
+    STACK = 0x7F00000000
+    PAGE_SIZE = 0x1000
+
+    emu_lastinstr_addr = 0
+    mmap = list()
+
+    def __init__(self) -> None:
+        Uc.__init__(self, UC_ARCH_X86, UC_MODE_64)
+
+        self.mmap.clear()
+        self.emu_lastinstr_addr = 0
+
+        # initialize stack
+        self.mem_map(self.STACK, 2*0x1000)
+        self.reg_write(UC_X86_REG_RBP, self.STACK + 0x1000)
+        self.reg_write(UC_X86_REG_RSP, self.STACK)
+        self.reg_write(UC_X86_REG_DR7, 0x400)
+
+        # hook
+        self.hook_add(UC_HOOK_CODE, self.hooked_code)
+        self.hook_add(UC_HOOK_MEM_READ_UNMAPPED, self.hooked_invalid_memory_read)
+
+        print("[+] Emulator initialize successful")
+        pass
+
+
+    def page_align(self, addr) -> int:
+        return (addr // self.PAGE_SIZE) * self.PAGE_SIZE
+    
+
+    
+    def ptr_valid(self, addr) -> bool:
+        for map_base, size in self.mmap:
+            if addr >= map_base and addr < map_base + size:
+                return True
+        return False
+
+    def map_seg(self, addr):
+        seg = idaapi.getseg(addr)
+        map_base = self.page_align(seg.start_ea)
+        map_size = self.page_align(seg.end_ea - map_base)
+        if map_size == 0:
+            map_size = self.PAGE_SIZE
+
+        print("[+] Enter map:", hex(map_base), hex(map_size))
+        self.mem_map(map_base, map_size )
+        code = read_memory(seg.start_ea, seg.end_ea - seg.start_ea)
+        self.mem_write(seg.start_ea, code)
+        self.mmap.append( (map_base, map_size) )
+        print("[+] Mapped seg: ", idaapi.get_segm_name(seg), hex(seg.start_ea), hex(seg.end_ea))
+
+        pass
+
+    def hooked_code(self, emu, address, size, user_data):
+        print(" - ", hex(address))
+        instr = idaapi.print_insn_mnem(emulator.emu_lastinstr_addr)
+        if instr == "pxor" or instr == "xor":
+            dec_reg = None
+            dec_buf_reg = None
+            buf_size = 0
+            if "xmm0" in idaapi.print_operand(emulator.emu_lastinstr_addr, 0):
+                dec_reg = "XMM0"
+                dec_buf_reg = UC_X86_REG_XMM0
+                buf_size = 16
+            elif "rax" in idaapi.print_operand(emulator.emu_lastinstr_addr, 0):
+                dec_reg = "RAX"
+                dec_buf_reg = UC_X86_REG_RAX
+                buf_size = 8
+            else:
+                print("[-] Unsupport decrypt instr:", hex(emulator.emu_lastinstr_addr))
+                emulator.emu_lastinstr_addr = address
+                return
+
+            print(f"[+] {dec_reg}: {hex(emu.reg_read(dec_buf_reg))}")
+            decrypted_str = emulator.reg_read(dec_buf_reg).to_bytes(buf_size, "little").decode()
+            print("[+] Decrypt string:", decrypted_str)
+            idaapi.set_cmt(address, decrypted_str, True)
+
+            cfunc = idaapi.decompile(address)
+            tl = idaapi.treeloc_t()
+            tl.ea = address
+            tl.itp = idaapi.ITP_SEMI
+            cfunc.set_user_cmt(tl, decrypted_str)
+            cfunc.save_user_cmts()
+            
+            emu.emu_stop()
+        emulator.emu_lastinstr_addr = address
+
+
+    def hooked_invalid_memory_read(self, emu, access, address, size, value, user_data):
+
+        if access == UC_MEM_READ_UNMAPPED:
+            print("Invalid memory read at address:", hex(address))
+            emulator.map_seg(address)
+            print("[+] Continue running...")
+                
+            return True         # Unicorn continue running
+        else:
+            print("[-] Unexpected memory read at address : ", access)
+        
+        return False    # unhandle
+    
+    def emulate(self, start_address, end_address):
+        # Map .text
+        if emulator.ptr_valid(start_address) == False:
+            emulator.map_seg(start_address)
+        self.emu_lastinstr_addr = start_address
+        print("[+] Emulating {:X} -> {:X}".format(start_address, end_address))
+        emulator.emu_start(start_address, end_address)
+
+emulator = Emulator()
 
 class VulnChoose(idaapi.Choose):
     """
@@ -116,6 +252,11 @@ class hotkey_action_handler_t(idaapi.action_handler_t):
                 else:
                     print("Goto location 0x%X (FO)" % idaapi.get_fileregion_offset(loc))
                 idc.jumpto(loc)
+        elif self.action == ACTION_GOTOEA:
+            jump_ea()
+        elif self.action == ACTION_REINIT_EMULATOR:
+            global emulator
+            emulator = Emulator()
         return 1
 
     def update(self, ctx):
@@ -251,8 +392,18 @@ class menu_action_handler_t(idaapi.action_handler_t):
             t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
             if idaapi.read_selection(view, t0, t1):
                 start, end = t0.place(view).toea(), t1.place(view).toea()
+                end += idaapi.decode_insn(idaapi.insn_t(), end)
                 idaapi.patch_bytes(start, b"\x90" * (end - start))
                 print("\n[+] Fill 0x%X - 0x%X (%u bytes) with NOPs" % (start, end, end - start))
+            else:
+                length = 0
+                patch_addr = idaapi.get_screen_ea()
+                if idaapi.print_insn_mnem(patch_addr) == None:
+                    length = 1      # is not an instr
+                else:
+                    length = idaapi.decode_insn(idaapi.insn_t(), patch_addr)
+                idaapi.patch_bytes(patch_addr, b"\x90" * length)
+                print("\n[+] Fill 0x%X - 0x%X (%u bytes) with NOPs" % (patch_addr, patch_addr + length, length))
         elif self.action == ACTION_SCANVUL:
             print("\n[+] Finding Format String Vulnerability...")
             found = []
@@ -270,6 +421,18 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 ch.Show()
             else:
                 print("[-] No format string vulnerabilities found.")
+        elif self.action == ACTION_EMULATE:
+            global emulator
+            print("Click ACTION_EMULATE : ", hex(idaapi.get_screen_ea()))
+
+            t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
+            if idaapi.read_selection(view, t0, t1):
+                start_addr, end_addr = t0.place(view).toea(), t1.place(view).toea()
+                end_addr += idaapi.decode_insn(idaapi.insn_t(), end_addr)
+            else:
+                start_addr = idaapi.get_screen_ea()
+                end_addr = start_addr + 0x1000
+            emulator.emulate(start_addr, end_addr)
         else:
             return 0
 
@@ -472,11 +635,12 @@ class UI_Hook(idaapi.UI_Hooks):
         else:
             dump_type = idaapi.BWN_DUMP
 
+        idaapi.attach_action_to_popup(form, popup, ACTION_FILLNOP, None)
+
         if form_type == idaapi.BWN_DISASM or form_type == dump_type:
             t0, t1, view = idaapi.twinpos_t(), idaapi.twinpos_t(), idaapi.get_current_viewer()
             if idaapi.read_selection(view, t0, t1) or idc.get_item_size(idc.get_screen_ea()) > 1:
                 idaapi.attach_action_to_popup(form, popup, ACTION_XORDATA, None)
-                idaapi.attach_action_to_popup(form, popup, ACTION_FILLNOP, None)
                 for action in ACTION_CONVERT:
                     idaapi.attach_action_to_popup(form, popup, action, "Dump/")
 
@@ -484,7 +648,8 @@ class UI_Hook(idaapi.UI_Hooks):
                                                                (idaapi.PLFM_386, 64),
                                                                (idaapi.PLFM_ARM, 32),]:
             idaapi.attach_action_to_popup(form, popup, ACTION_SCANVUL, None)
-
+            idaapi.attach_action_to_popup(form, popup, ACTION_EMULATE, None)
+        
 
 class HexRays_Hook(object):
     def callback(self, event, *args):
@@ -515,9 +680,9 @@ class HexRays_Hook(object):
 
 class LazyIDA_t(idaapi.plugin_t):
     flags = idaapi.PLUGIN_HIDE
-    comment = "LazyIDA"
+    comment = "NepIDA"
     help = ""
-    wanted_name = "LazyIDA"
+    wanted_name = "NepIDA"
     wanted_hotkey = ""
 
     def init(self):
@@ -547,7 +712,7 @@ class LazyIDA_t(idaapi.plugin_t):
             else:
                 BITS = 16
 
-        print("LazyIDA (v1.0.0.5) plugin has been loaded.")
+        print("NepIDA (v1.0.0.5) plugin has been loaded.")
 
         # Register menu actions
         menu_actions = (
@@ -564,6 +729,7 @@ class LazyIDA_t(idaapi.plugin_t):
             idaapi.action_desc_t(ACTION_XORDATA, "Get xored data", menu_action_handler_t(ACTION_XORDATA), None, None, 9),
             idaapi.action_desc_t(ACTION_FILLNOP, "Fill with NOPs", menu_action_handler_t(ACTION_FILLNOP), None, None, 9),
             idaapi.action_desc_t(ACTION_SCANVUL, "Scan format string vulnerabilities", menu_action_handler_t(ACTION_SCANVUL), None, None, 160),
+            idaapi.action_desc_t(ACTION_EMULATE, "Emulate", menu_action_handler_t(ACTION_EMULATE), None, None, 9),
         )
         for action in menu_actions:
             idaapi.register_action(action)
@@ -587,10 +753,10 @@ class LazyIDA_t(idaapi.plugin_t):
         # Add hexrays ui callback
         if idaapi.init_hexrays_plugin():
             addon = idaapi.addon_info_t()
-            addon.id = "tw.l4ys.lazyida"
+            addon.id = "nepnep.team"
             addon.name = "LazyIDA"
-            addon.producer = "Lays"
-            addon.url = "https://github.com/L4ys/LazyIDA"
+            addon.producer = "Nepnep"
+            addon.url = "https://github.com/NepnepSec/NepIDA"
             addon.version = "1.0.0.5"
             idaapi.register_addon(addon)
 
