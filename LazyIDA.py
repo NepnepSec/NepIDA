@@ -22,6 +22,7 @@ ACTION_FILLNOP = "Qfrost:fillnop"
 ACTION_GOTOEA = "huskygg:gotoea"
 ACTION_EMULATE = "Qfrost:emulate"
 ACTION_REINIT_EMULATOR = "Qfrost:reinit_emulator"
+ACTION_XREF = "lazycross:xref"
 
 ACTION_HX_REMOVERETTYPE = "lazyida:hx_removerettype"
 ACTION_HX_COPYEA = "lazyida:hx_copyea"
@@ -433,6 +434,8 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 start_addr = idaapi.get_screen_ea()
                 end_addr = start_addr + 0x1000
             emulator.emulate(start_addr, end_addr)
+        elif self.action == ACTION_XREF:
+            show_xref(idaapi.get_screen_ea())
         else:
             return 0
 
@@ -620,6 +623,105 @@ class hexrays_action_handler_t(idaapi.action_handler_t):
 
         return False
 
+class XrefChoose(idaapi.Choose):
+    def __init__(self, title, items):
+        idaapi.Choose.__init__(self, title, [["Address", 30], ["Pseudocode line", 80]], embedded=False, width=100, icon=40)
+        self.items = items
+
+    def OnClose(self):
+        pass
+
+    def OnGetLine(self, n):
+        item = self.items[n]
+        return [idc.get_func_off_str(item["addr"]), item["line"]]
+
+    def OnGetSize(self):
+        return len(self.items)
+
+    def OnSelectLine(self, n):
+        idaapi.jumpto(self.items[n]["addr"])
+
+class ObjVisitor(idaapi.ctree_visitor_t):
+    def __init__(self, ea, cfunc):
+        idaapi.ctree_visitor_t.__init__(self, idaapi.CV_FAST)
+        self.found = []
+        self.target_ea = ea
+        self.cfunc = cfunc
+
+    def visit_expr(self, expr):
+        # check callee ea
+        if expr.obj_ea != self.target_ea:
+            return 0
+
+        # find top expr
+        e = expr
+        addr = expr.ea
+        while True:
+            p = self.cfunc.body.find_parent_of(e)
+            if not p or p.op > idaapi.cit_empty:
+                break
+            e = p
+            if e.ea != idaapi.BADADDR:
+                addr = e.ea
+
+        self.found.append({
+            "addr": addr,
+            "line": idaapi.tag_remove(e.print1(None))
+        })
+        return 0
+
+def show_xref(ea):
+    name = idaapi.get_name(ea)
+    demangled = idc.demangle_name(name, idc.get_inf_attr(idc.INF_SHORT_DN))
+    if demangled:
+        name = demangled
+    print(f"LazyIDA: Find cross reference to {name}...")
+
+    found = []
+    checked = []
+    for ref in idautils.XrefsTo(ea, False):
+        if idaapi.user_cancelled():
+            raise KeyboardInterrupt
+
+        frm = ref.frm
+        if not idaapi.is_code(idaapi.get_flags(frm)):
+            continue
+
+        func = idaapi.get_func(frm)
+        func_name = idaapi.get_func_name(frm)
+        if not func:
+            print(f"LazyIDA: Reference is not from a function: 0x{frm:x}")
+            continue
+
+        if func.start_ea in checked:
+            continue
+        checked.append(func.start_ea)
+
+        try:
+            cfunc = idaapi.decompile(func)
+        except idaapi.DecompilationFailure as e:
+            print(f"LazyIDA: Decompile {func_name} failed")
+            print(str(e))
+            continue
+
+        if not cfunc:
+            print(f"LazyIDA: cfunc is none: {func_name}")
+            continue
+
+        cv = ObjVisitor(ea, cfunc)
+        try:
+            cv.apply_to(cfunc.body, None)
+        except Exception as e:
+            print(cfunc)
+            print(e)
+        found += cv.found
+
+    if found:
+        ch = XrefChoose(f"Cross references to {name}", found)
+        ch.Show()
+    else:
+        print("LazyIDA: No xrefs found")
+
 class UI_Hook(idaapi.UI_Hooks):
     def __init__(self):
         idaapi.UI_Hooks.__init__(self)
@@ -644,6 +746,11 @@ class UI_Hook(idaapi.UI_Hooks):
                 for action in ACTION_CONVERT:
                     idaapi.attach_action_to_popup(form, popup, action, "Dump/")
 
+            # Add xref action
+            ea = idaapi.get_screen_ea()
+            if ea != idaapi.BADADDR:
+                idaapi.attach_action_to_popup(form, popup, ACTION_XREF, None)
+
         if form_type == idaapi.BWN_DISASM and (ARCH, BITS) in [(idaapi.PLFM_386, 32),
                                                                (idaapi.PLFM_386, 64),
                                                                (idaapi.PLFM_ARM, 32),]:
@@ -657,6 +764,9 @@ class HexRays_Hook(object):
             form, phandle, vu = args
             if vu.item.citype == idaapi.VDI_FUNC or (vu.item.citype == idaapi.VDI_EXPR and vu.item.e.is_expr() and vu.item.e.type.is_funcptr()):
                 idaapi.attach_action_to_popup(form, phandle, ACTION_HX_REMOVERETTYPE, None)
+            # Add xref action for pseudocode
+            if vu.item.get_ea() != idaapi.BADADDR:
+                idaapi.attach_action_to_popup(form, phandle, ACTION_XREF, None)
         elif event == idaapi.hxe_double_click:
             vu, shift_state = args
             # auto jump to target if clicked item is xxx->func();
@@ -730,6 +840,7 @@ class LazyIDA_t(idaapi.plugin_t):
             idaapi.action_desc_t(ACTION_FILLNOP, "Fill with NOPs", menu_action_handler_t(ACTION_FILLNOP), None, None, 9),
             idaapi.action_desc_t(ACTION_SCANVUL, "Scan format string vulnerabilities", menu_action_handler_t(ACTION_SCANVUL), None, None, 160),
             idaapi.action_desc_t(ACTION_EMULATE, "Emulate", menu_action_handler_t(ACTION_EMULATE), None, None, 9),
+            idaapi.action_desc_t(ACTION_XREF, "LazyCross", menu_action_handler_t(ACTION_XREF), "Ctrl+X", None, 40),
         )
         for action in menu_actions:
             idaapi.register_action(action)
