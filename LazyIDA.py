@@ -286,6 +286,9 @@ class menu_action_handler_t(idaapi.action_handler_t):
     def __init__(self, action):
         idaapi.action_handler_t.__init__(self)
         self.action = action
+    def update(self, ctx):
+        return idaapi.AST_ENABLE_FOR_WIDGET if ctx.widget_type in [idaapi.BWN_DISASM, idaapi.BWN_PSEUDOCODE] else idaapi.AST_DISABLE_FOR_WIDGET
+
 
     def activate(self, ctx):
         if self.action in ACTION_CONVERT:
@@ -435,7 +438,21 @@ class menu_action_handler_t(idaapi.action_handler_t):
                 end_addr = start_addr + 0x1000
             emulator.emulate(start_addr, end_addr)
         elif self.action == ACTION_XREF:
-            show_xref(idaapi.get_screen_ea())
+            if ctx.widget_type == idaapi.BWN_PSEUDOCODE:
+                vu = idaapi.get_widget_vdui(ctx.widget)
+                ea = vu.item.get_ea()
+            elif ctx.widget_type == idaapi.BWN_DISASM:
+                ea = idaapi.get_screen_ea()
+            else:
+                return 0
+
+            try:
+                idaapi.show_wait_box("Processing...")
+                show_xref(ea)
+            except KeyboardInterrupt:
+                print("LazyCross: User interrupted")
+            finally:
+                idaapi.hide_wait_box()
         else:
             return 0
 
@@ -641,6 +658,7 @@ class XrefChoose(idaapi.Choose):
     def OnSelectLine(self, n):
         idaapi.jumpto(self.items[n]["addr"])
 
+
 class ObjVisitor(idaapi.ctree_visitor_t):
     def __init__(self, ea, cfunc):
         idaapi.ctree_visitor_t.__init__(self, idaapi.CV_FAST)
@@ -675,7 +693,7 @@ def show_xref(ea):
     demangled = idc.demangle_name(name, idc.get_inf_attr(idc.INF_SHORT_DN))
     if demangled:
         name = demangled
-    print(f"LazyIDA: Find cross reference to {name}...")
+    print(f"LazyCross: Find cross reference to {name}...")
 
     found = []
     checked = []
@@ -690,7 +708,7 @@ def show_xref(ea):
         func = idaapi.get_func(frm)
         func_name = idaapi.get_func_name(frm)
         if not func:
-            print(f"LazyIDA: Reference is not from a function: 0x{frm:x}")
+            print(f"LazyCross: Reference is not from a function: 0x{frm:x}")
             continue
 
         if func.start_ea in checked:
@@ -700,12 +718,12 @@ def show_xref(ea):
         try:
             cfunc = idaapi.decompile(func)
         except idaapi.DecompilationFailure as e:
-            print(f"LazyIDA: Decompile {func_name} failed")
+            print(f"LazyCross: Decompile {func_name} failed")
             print(str(e))
             continue
 
         if not cfunc:
-            print(f"LazyIDA: cfunc is none: {func_name}")
+            print(f"LazyCross: cfunc is none: {func_name}")
             continue
 
         cv = ObjVisitor(ea, cfunc)
@@ -720,7 +738,7 @@ def show_xref(ea):
         ch = XrefChoose(f"Cross references to {name}", found)
         ch.Show()
     else:
-        print("LazyIDA: No xrefs found")
+        print("LazyCross: No xrefs found")
 
 class UI_Hook(idaapi.UI_Hooks):
     def __init__(self):
@@ -748,7 +766,7 @@ class UI_Hook(idaapi.UI_Hooks):
 
             # Add xref action
             ea = idaapi.get_screen_ea()
-            if ea != idaapi.BADADDR:
+            if ea == idaapi.BADADDR:
                 idaapi.attach_action_to_popup(form, popup, ACTION_XREF, None)
 
         if form_type == idaapi.BWN_DISASM and (ARCH, BITS) in [(idaapi.PLFM_386, 32),
